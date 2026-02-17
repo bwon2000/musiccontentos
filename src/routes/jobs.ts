@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { supabase } from "../supabase.js";
+import { getDatasetItems, runTikTokHashtagScraper } from "../apify.js";
 
 const analyzeVideoSchema = z.object({
   video_id: z.string().uuid(),
@@ -13,6 +14,15 @@ const recomputePatternsSchema = z.object({
 
 const generateIdeasSchema = z.object({
   count: z.number().int().min(1).max(100).optional().default(5),
+});
+
+const ingestVideosSchema = z.object({
+  platform: z.literal("tiktok"),
+  seeds: z.object({
+    hashtags: z.array(z.string()).min(1),
+  }),
+  limit: z.number().int().min(1).max(1000).optional(),
+  resultsPerHashtag: z.number().int().min(1).max(100).optional(),
 });
 
 type JobStatus = "running" | "done" | "error";
@@ -422,6 +432,167 @@ jobsRoutes.post("/generate_ideas", async (c) => {
       await updateJob(jobId, {
         status: "error",
         error_message: err instanceof Error ? err.message : "Unknown error",
+      }).catch(() => {});
+    }
+    return c.json(
+      { ok: false, error: err instanceof Error ? err.message : "Internal error" },
+      500
+    );
+  }
+});
+
+/** Map Apify TikTok item to videos row. Returns null if no video_url. */
+function normalizeApifyItemToVideo(
+  item: Record<string, unknown>,
+  pulledAt: string
+): Record<string, unknown> | null {
+  const videoUrl =
+    (item.videoUrl as string) ??
+    (item.url as string) ??
+    (item.webVideoUrl as string) ??
+    (item.link as string);
+  if (!videoUrl || typeof videoUrl !== "string") return null;
+
+  const createTime = item.createTime as number | undefined;
+  const postDate =
+    (item.createTimeISO as string) ||
+    (typeof createTime === "number"
+      ? new Date(createTime * 1000).toISOString()
+      : null);
+
+  return {
+    video_url: videoUrl,
+    creator_handle:
+      (item.authorMeta as Record<string, unknown>)?.name ??
+      (item.author as Record<string, unknown>)?.uniqueId ??
+      item.authorName ??
+      null,
+    caption: (item.text as string) ?? (item.caption as string) ?? (item.desc as string) ?? null,
+    post_date: postDate,
+    views:
+      (item.stats as Record<string, unknown>)?.viewsCount ??
+      item.playCount ??
+      item.viewCount ??
+      null,
+    likes:
+      (item.stats as Record<string, unknown>)?.likesCount ??
+      item.diggCount ??
+      item.likeCount ??
+      null,
+    comments_count:
+      (item.stats as Record<string, unknown>)?.commentsCount ??
+      item.commentCount ??
+      null,
+    shares:
+      (item.stats as Record<string, unknown>)?.sharesCount ?? item.shareCount ?? null,
+    saves:
+      (item.stats as Record<string, unknown>)?.savedCount ?? item.collectCount ?? null,
+    platform: "tiktok",
+    pulled_at: pulledAt,
+    updated_at: pulledAt,
+  };
+}
+
+jobsRoutes.post("/ingest_videos", async (c) => {
+  let jobId: string | null = null;
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = ingestVideosSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        { ok: false, error: "Invalid request", details: parsed.error.flatten() },
+        400
+      );
+    }
+    const { platform, seeds, limit, resultsPerHashtag } = parsed.data;
+
+    const apifyToken = process.env.APIFY_TOKEN;
+    const apifyActorId =
+      process.env.APIFY_ACTOR_ID ?? "clockworks/tiktok-hashtag-scraper";
+    if (!apifyToken) {
+      return c.json(
+        { ok: false, error: "APIFY_TOKEN is not configured" },
+        500
+      );
+    }
+
+    const payload = {
+      platform,
+      seeds,
+      limit: limit ?? undefined,
+      resultsPerHashtag: resultsPerHashtag ?? undefined,
+    };
+    jobId = await createJob("ingest_videos", payload);
+
+    const hashtags = seeds.hashtags;
+    const runData = await runTikTokHashtagScraper(
+      apifyActorId,
+      apifyToken,
+      {
+        hashtags,
+        resultsPerPage: resultsPerHashtag ?? 25,
+        proxyConfiguration: {
+          useApifyProxy: true,
+          apifyProxyGroups: ["RESIDENTIAL"],
+        },
+      },
+      120
+    );
+
+    const limitNum = limit ?? 200;
+    const items = await getDatasetItems<Record<string, unknown>>(
+      runData.defaultDatasetId,
+      apifyToken,
+      limitNum
+    );
+
+    const pulledAt = new Date().toISOString();
+    const rows: Record<string, unknown>[] = [];
+    for (const item of items) {
+      const row = normalizeApifyItemToVideo(item, pulledAt);
+      if (row) rows.push(row);
+    }
+
+    const total = items.length;
+    const skipped = total - rows.length;
+
+    if (rows.length > 0) {
+      const { error: upsertError } = await supabase
+        .from("videos")
+        .upsert(rows, { onConflict: "video_url" });
+
+      if (upsertError) {
+        await updateJob(jobId, {
+          status: "error",
+          error_message: upsertError.message,
+        });
+        return c.json(
+          { ok: false, error: upsertError.message, job_id: jobId },
+          500
+        );
+      }
+    }
+
+    const result = { total, upserted: rows.length, skipped };
+    await updateJob(jobId, {
+      status: "done",
+      result,
+    });
+
+    return c.json({
+      ok: true,
+      job_id: jobId,
+      ...result,
+    });
+  } catch (err) {
+    console.error("ingest_videos error:", err);
+    if (jobId) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
+      await updateJob(jobId, {
+        status: "error",
+        error_message: truncated,
       }).catch(() => {});
     }
     return c.json(

@@ -16,6 +16,8 @@ Copy `.env.example` to `.env` and set:
 
 - `SUPABASE_URL` – your Supabase project URL
 - `SUPABASE_SERVICE_ROLE_KEY` – service role key (never expose to client)
+- `APIFY_TOKEN` – required for `/jobs/ingest_videos` (TikTok scraper)
+- `APIFY_ACTOR_ID` – optional, default `clockworks/tiktok-hashtag-scraper`
 - `PORT` – optional, default `3000`
 
 ## Local run
@@ -38,6 +40,7 @@ API base: `http://localhost:3000`
 | POST   | `/jobs/analyze_video` | Analyze one video (placeholder → video_analysis) |
 | POST   | `/jobs/recompute_patterns` | Recompute placeholder patterns (hook_type) |
 | POST   | `/jobs/generate_ideas` | Generate N placeholder ideas |
+| POST   | `/jobs/ingest_videos` | Ingest TikTok videos via Apify → `videos` table |
 
 ## cURL examples
 
@@ -99,6 +102,23 @@ curl -X POST http://localhost:3000/jobs/generate_ideas \
 ```
 
 Expected: `{"ok":true,"job_id":"...","ideas_written":N}`
+
+### Ingest videos (Apify TikTok scraper)
+
+Requires `APIFY_TOKEN` in env. Populates `videos` from TikTok hashtags.
+
+```bash
+curl -X POST http://localhost:3000/jobs/ingest_videos \
+  -H "Content-Type: application/json" \
+  -d '{
+    "platform": "tiktok",
+    "seeds": { "hashtags": ["edm", "edmtiktok"] },
+    "limit": 50,
+    "resultsPerHashtag": 25
+  }'
+```
+
+Expected: `{"ok":true,"job_id":"...","total":N,"upserted":N,"skipped":N}`
 
 ## Deploy
 
