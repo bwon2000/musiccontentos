@@ -29,6 +29,12 @@ const ingestVideosSchema = z.object({
   resultsPerHashtag: z.number().int().min(1).max(100).optional(),
 });
 
+const computeBucketsSchema = z.object({
+  metric: z.enum(["views", "engagement_rate"]).optional().default("views"),
+  platform: z.enum(["tiktok", "instagram", "youtube"]).optional(),
+  min_views: z.number().int().min(0).optional().default(0),
+});
+
 type JobStatus = "running" | "done" | "error";
 
 async function createJob(
@@ -85,6 +91,9 @@ export type AnalyzeBatchResult =
   | { job_id: string; error: string };
 export type RecomputePatternsResult =
   | { job_id: string; patterns_written: number }
+  | { job_id: string; error: string };
+export type ComputeBucketsResult =
+  | { job_id: string; total_scored: number; top_count: number; bottom_count: number; updated_count: number }
   | { job_id: string; error: string };
 
 export const EDM_HASHTAGS = [
@@ -252,7 +261,7 @@ export async function executeAnalyzeBatch(
   }
 }
 
-/** Executor: recompute_patterns. Used by POST /jobs/recompute_patterns and cron. */
+/** Executor: recompute_patterns. Uses top vs bottom performance buckets for uplift. */
 export async function executeRecomputePatterns(
   params?: { platform?: string; metric?: string },
   options?: { mode?: "cron" }
@@ -268,32 +277,39 @@ export async function executeRecomputePatterns(
     if (fetchError) throw fetchError;
 
     const rows = analyses ?? [];
-    const byHookType: Record<string, { count: number; videoIds: string[] }> = {};
-    for (const row of rows) {
-      const key = row.hook_type ?? "unknown";
-      if (!byHookType[key]) byHookType[key] = { count: 0, videoIds: [] };
-      byHookType[key].count += 1;
-      byHookType[key].videoIds.push(row.video_id);
+    const videoIds = rows.map((r) => r.video_id).filter(Boolean);
+    if (videoIds.length === 0) {
+      await updateJob(jobId, { status: "done", result: { patterns_written: 0 } });
+      return { job_id: jobId, patterns_written: 0 };
     }
 
-    const videoIds = rows.map((r) => r.video_id).filter(Boolean);
-    const { data: videoStats } = await supabase
+    const { data: videoBuckets } = await supabase
       .from("videos")
-      .select("id, views, engagement_rate")
+      .select("id, performance_bucket")
       .in("id", videoIds);
 
-    const viewsByVideo = new Map(
-      (videoStats ?? []).map((v) => [v.id, Number(v.views) ?? 0])
+    const topIds = new Set(
+      (videoBuckets ?? []).filter((v) => v.performance_bucket === "top").map((v) => v.id)
     );
-    const engagementByVideo = new Map(
-      (videoStats ?? []).map((v) => [v.id, Number(v.engagement_rate) ?? 0])
+    const bottomIds = new Set(
+      (videoBuckets ?? []).filter((v) => v.performance_bucket === "bottom").map((v) => v.id)
     );
-    const overallAvgViews =
-      videoStats?.length &&
-      videoStats.reduce((s, v) => s + (Number(v.views) ?? 0), 0) / videoStats.length;
-    const overallAvgEng =
-      videoStats?.length &&
-      videoStats.reduce((s, v) => s + (Number(v.engagement_rate) ?? 0), 0) / videoStats.length;
+    const totalTop = topIds.size;
+    const totalBottom = bottomIds.size;
+
+    type HookAgg = { topCount: number; bottomCount: number; topVideoIds: string[] };
+    const byHookType: Record<string, HookAgg> = {};
+    for (const row of rows) {
+      const key = row.hook_type ?? "unknown";
+      if (!byHookType[key]) byHookType[key] = { topCount: 0, bottomCount: 0, topVideoIds: [] };
+      const vid = row.video_id;
+      if (topIds.has(vid)) {
+        byHookType[key].topCount += 1;
+        if (byHookType[key].topVideoIds.length < 5) byHookType[key].topVideoIds.push(vid);
+      } else if (bottomIds.has(vid)) {
+        byHookType[key].bottomCount += 1;
+      }
+    }
 
     const now = new Date().toISOString();
     const patternsToInsert: Array<{
@@ -309,29 +325,24 @@ export async function executeRecomputePatterns(
     }> = [];
 
     const entries = Object.entries(byHookType)
-      .sort((a, b) => b[1].count - a[1].count)
+      .filter(([, agg]) => agg.topCount + agg.bottomCount >= 1)
+      .sort((a, b) => b[1].topCount + b[1].bottomCount - (a[1].topCount + a[1].bottomCount))
       .slice(0, 20);
 
-    for (const [hookType, { count, videoIds: ids }] of entries) {
-      const views = ids.map((id) => viewsByVideo.get(id) ?? 0).filter(Boolean);
-      const engagements = ids.map((id) => engagementByVideo.get(id) ?? 0).filter(Boolean);
-      const avgViews = views.length ? views.reduce((a, b) => a + b, 0) / views.length : null;
-      const avgEng = engagements.length
-        ? engagements.reduce((a, b) => a + b, 0) / engagements.length
-        : null;
+    for (const [hookType, agg] of entries) {
+      const topFreq = totalTop > 0 ? agg.topCount / totalTop : null;
+      const bottomFreq = totalBottom > 0 ? agg.bottomCount / totalBottom : null;
       const uplift =
-        overallAvgViews && avgViews
-          ? (avgViews - overallAvgViews) / overallAvgViews
-          : null;
+        topFreq != null && bottomFreq != null ? topFreq - bottomFreq : null;
       patternsToInsert.push({
         feature_name: "hook_type",
         feature_value: hookType,
-        sample_size: count,
-        top_freq: avgViews ?? 0,
-        bottom_freq: avgEng ?? 0,
+        sample_size: agg.topCount + agg.bottomCount,
+        top_freq: topFreq ?? 0,
+        bottom_freq: bottomFreq ?? 0,
         uplift,
-        confidence_score: count >= 3 ? 0.8 : 0.5,
-        examples: ids.slice(0, 5),
+        confidence_score: agg.topCount + agg.bottomCount >= 3 ? 0.8 : 0.5,
+        examples: agg.topVideoIds,
         computed_at: now,
       });
     }
@@ -350,6 +361,117 @@ export async function executeRecomputePatterns(
       },
     });
     return { job_id: jobId, patterns_written: patternsToInsert.length };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
+    if (jobId) await updateJob(jobId, { status: "error", error_message: truncated }).catch(() => {});
+    return { job_id: jobId!, error: msg };
+  }
+}
+
+const BUCKET_UPDATE_CHUNK_SIZE = 100;
+
+/** Executor: compute_buckets. Labels videos into top/mid/bottom by metric, updates engagement_rate. */
+export async function executeComputeBuckets(params: {
+  metric?: "views" | "engagement_rate";
+  platform?: string;
+  min_views?: number;
+}): Promise<ComputeBucketsResult> {
+  const payload = { mode: "compute_buckets" as const, ...params };
+  let jobId: string | null = null;
+  try {
+    jobId = await createJob("recompute_patterns", payload);
+
+    const metric = params.metric ?? "views";
+    const minViews = params.min_views ?? 0;
+    let query = supabase
+      .from("videos")
+      .select("id, views, likes, comments_count, shares, engagement_rate, platform");
+
+    if (params.platform) query = query.eq("platform", params.platform);
+    const { data: videos, error: fetchError } = await query;
+    if (fetchError) throw fetchError;
+
+    const rows = (videos ?? []) as Array<{
+      id: string;
+      views: number | null;
+      likes: number | null;
+      comments_count: number | null;
+      shares: number | null;
+      engagement_rate: number | null;
+      platform: string | null;
+    }>;
+
+    type Scored = { id: string; engagement_rate: number | null; metricValue: number };
+    const scored: Scored[] = [];
+    for (const v of rows) {
+      const views = Number(v.views) ?? 0;
+      const likes = Number(v.likes) ?? 0;
+      const comments = Number(v.comments_count) ?? 0;
+      const shares = Number(v.shares) ?? 0;
+      let engagementRate: number | null = v.engagement_rate != null ? Number(v.engagement_rate) : null;
+      if (engagementRate == null && views > 0 && (likes + comments + shares) >= 0) {
+        engagementRate = (likes + comments + shares) / views;
+      }
+      const metricValue = metric === "engagement_rate"
+        ? (engagementRate ?? 0)
+        : views;
+      if (metricValue <= minViews) continue;
+      scored.push({ id: v.id, engagement_rate: engagementRate, metricValue });
+    }
+
+    scored.sort((a, b) => b.metricValue - a.metricValue);
+    const total = scored.length;
+    const topCount = Math.max(0, Math.floor(total * 0.2));
+    const bottomCount = Math.max(0, Math.floor(total * 0.2));
+    const topEnd = topCount;
+    const bottomStart = total - bottomCount;
+
+    const updates: Array<{ id: string; engagement_rate: number | null; top_20: boolean; performance_bucket: string }> = [];
+    for (let i = 0; i < scored.length; i++) {
+      const s = scored[i];
+      let performance_bucket: string;
+      let top_20: boolean;
+      if (i < topEnd) {
+        performance_bucket = "top";
+        top_20 = true;
+      } else if (i >= bottomStart) {
+        performance_bucket = "bottom";
+        top_20 = false;
+      } else {
+        performance_bucket = "mid";
+        top_20 = false;
+      }
+      updates.push({
+        id: s.id,
+        engagement_rate: s.engagement_rate,
+        top_20,
+        performance_bucket,
+      });
+    }
+
+    const now = new Date().toISOString();
+    let updatedCount = 0;
+    for (let i = 0; i < updates.length; i += BUCKET_UPDATE_CHUNK_SIZE) {
+      const chunk = updates.slice(i, i + BUCKET_UPDATE_CHUNK_SIZE).map((row) => ({
+        id: row.id,
+        engagement_rate: row.engagement_rate,
+        top_20: row.top_20,
+        performance_bucket: row.performance_bucket,
+        updated_at: now,
+      }));
+      const { error } = await supabase.from("videos").upsert(chunk, { onConflict: "id" });
+      if (!error) updatedCount += chunk.length;
+    }
+
+    const result = {
+      total_scored: total,
+      top_count: topCount,
+      bottom_count: bottomCount,
+      updated_count: updatedCount,
+    };
+    await updateJob(jobId, { status: "done", result });
+    return { job_id: jobId, ...result };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
     const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
@@ -555,6 +677,29 @@ jobsRoutes.post("/recompute_patterns", async (c) => {
     ok: true,
     job_id: result.job_id,
     patterns_written: result.patterns_written,
+  });
+});
+
+jobsRoutes.post("/compute_buckets", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = computeBucketsSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      { ok: false, error: "Invalid request", details: parsed.error.flatten() },
+      400
+    );
+  }
+  const result = await executeComputeBuckets(parsed.data);
+  if ("error" in result) {
+    return c.json({ ok: false, error: result.error, job_id: result.job_id }, 500);
+  }
+  return c.json({
+    ok: true,
+    job_id: result.job_id,
+    total_scored: result.total_scored,
+    top_count: result.top_count,
+    bottom_count: result.bottom_count,
+    updated_count: result.updated_count,
   });
 });
 
