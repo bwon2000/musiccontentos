@@ -16,8 +16,15 @@ const recomputePatternsSchema = z.object({
   metric: z.enum(["views", "engagement_rate"]).optional(),
 });
 
+const sourcePatternSchema = z.object({
+  feature_name: z.string(),
+  feature_value: z.string(),
+  uplift: z.number().optional(),
+});
+
 const generateIdeasSchema = z.object({
   count: z.number().int().min(1).max(100).optional().default(5),
+  source_patterns: z.array(sourcePatternSchema).optional(),
 });
 
 const ingestVideosSchema = z.object({
@@ -372,12 +379,17 @@ export async function executeRecomputePatterns(
 const BUCKET_UPDATE_CHUNK_SIZE = 100;
 
 /** Executor: compute_buckets. Labels videos into top/mid/bottom by metric, updates engagement_rate. */
-export async function executeComputeBuckets(params: {
-  metric?: "views" | "engagement_rate";
-  platform?: string;
-  min_views?: number;
-}): Promise<ComputeBucketsResult> {
-  const payload = { mode: "compute_buckets" as const, ...params };
+export async function executeComputeBuckets(
+  params: {
+    metric?: "views" | "engagement_rate";
+    platform?: string;
+    min_views?: number;
+  },
+  options?: { mode?: "cron" }
+): Promise<ComputeBucketsResult> {
+  const payload = options?.mode
+    ? { mode: "cron" as const, step: "compute_buckets", ...params }
+    : { mode: "compute_buckets" as const, ...params };
   let jobId: string | null = null;
   try {
     jobId = await createJob("recompute_patterns", payload);
@@ -703,6 +715,28 @@ jobsRoutes.post("/compute_buckets", async (c) => {
   });
 });
 
+/** Build templated idea fields from a list of patterns. */
+function ideaFromPatterns(
+  sourcePatterns: Array<{ feature_name: string; feature_value: string; uplift?: number }>,
+  index: number
+): {
+  title: string;
+  hook: string;
+  on_screen_text: string;
+  shot_list: unknown;
+  cta: string;
+} {
+  const p = sourcePatterns[index % sourcePatterns.length];
+  const label = `${p.feature_name}: ${p.feature_value}`;
+  return {
+    title: `Idea ${index + 1}: ${label}`,
+    hook: `Lead with ${p.feature_value} (${p.feature_name})`,
+    on_screen_text: `Use ${p.feature_name} = ${p.feature_value}`,
+    shot_list: [],
+    cta: `CTA: test ${p.feature_value}`,
+  };
+}
+
 jobsRoutes.post("/generate_ideas", async (c) => {
   let jobId: string | null = null;
 
@@ -715,15 +749,56 @@ jobsRoutes.post("/generate_ideas", async (c) => {
         400
       );
     }
-    const { count } = parsed.data;
-    jobId = await createJob("generate_ideas", { count });
+    const { count, source_patterns: requestedPatterns } = parsed.data;
+
+    let sourcePatterns: Array<{ feature_name: string; feature_value: string; uplift?: number }>;
+    if (requestedPatterns && requestedPatterns.length > 0) {
+      sourcePatterns = requestedPatterns.map((p) => ({
+        feature_name: p.feature_name,
+        feature_value: p.feature_value,
+        uplift: p.uplift,
+      }));
+    } else {
+      const { data: topPatterns, error: fetchErr } = await supabase
+        .from("patterns")
+        .select("feature_name, feature_value, uplift")
+        .order("uplift", { ascending: false, nullsFirst: false })
+        .limit(Math.max(count, 20));
+
+      if (fetchErr) {
+        return c.json(
+          { ok: false, error: fetchErr.message },
+          500
+        );
+      }
+      sourcePatterns = (topPatterns ?? []).map((r) => ({
+        feature_name: String(r.feature_name ?? ""),
+        feature_value: String(r.feature_value ?? ""),
+        uplift: r.uplift != null ? Number(r.uplift) : undefined,
+      }));
+      if (sourcePatterns.length === 0) {
+        sourcePatterns = [{ feature_name: "hook_type", feature_value: "placeholder" }];
+      }
+    }
+
+    const payload = { count, source_patterns: sourcePatterns };
+    jobId = await createJob("generate_ideas", payload);
 
     const now = new Date().toISOString();
-    const ideasToInsert = Array.from({ length: count }, () => ({
-      status: "draft",
-      created_at: now,
-      updated_at: now,
-    }));
+    const ideasToInsert = Array.from({ length: count }, (_, i) => {
+      const templated = ideaFromPatterns(sourcePatterns, i);
+      return {
+        status: "draft",
+        source_patterns: sourcePatterns,
+        title: templated.title,
+        hook: templated.hook,
+        on_screen_text: templated.on_screen_text,
+        shot_list: templated.shot_list,
+        cta: templated.cta,
+        created_at: now,
+        updated_at: now,
+      };
+    });
 
     const { error: insertError } = await supabase
       .from("ideas")
@@ -740,15 +815,17 @@ jobsRoutes.post("/generate_ideas", async (c) => {
       );
     }
 
+    const result = { ideas_written: count, source_patterns: sourcePatterns };
     await updateJob(jobId, {
       status: "done",
-      result: { ideas_written: count },
+      result,
     });
 
     return c.json({
       ok: true,
       job_id: jobId,
       ideas_written: count,
+      source_patterns: sourcePatterns,
     });
   } catch (err) {
     console.error("generate_ideas error:", err);

@@ -3,6 +3,7 @@ import { supabase } from "../supabase.js";
 import {
   EDM_HASHTAGS,
   executeAnalyzeBatch,
+  executeComputeBuckets,
   executeIngestVideos,
   executeRecomputePatterns,
 } from "./jobs.js";
@@ -94,5 +95,48 @@ cronRoutes.get("/analyze", async (c) => {
     job_id: result.job_id,
     analyzed: result.analyzed,
     errors: result.errors,
+  });
+});
+
+/** GET /cron/refresh_insights – runs compute_buckets (defaults) then recompute_patterns. Overlap guard: 409 if recent cron job running. */
+cronRoutes.get("/refresh_insights", async (c) => {
+  const secret =
+    c.req.header("x-cron-secret") ??
+    c.req.header("x_cron_secret") ??
+    c.req.header("X-CRON-SECRET") ??
+    c.req.header("X_CRON_SECRET");
+  const expected = process.env.CRON_SECRET;
+  if (!expected || secret !== expected) {
+    console.log("cron unauthorized", { hasExpected: !!expected, hasSecret: !!secret });
+    return c.json({ ok: false, error: "Unauthorized" }, 401);
+  }
+
+  if (await hasRecentCronRun()) {
+    return c.json({ ok: false, error: "already running" }, 409);
+  }
+
+  const buckets = await executeComputeBuckets({ metric: "views" }, { mode: "cron" });
+  const patterns = await executeRecomputePatterns(undefined, { mode: "cron" });
+
+  return c.json({
+    ok: true,
+    ran: "refresh_insights",
+    buckets: {
+      job_id: buckets.job_id,
+      ...("error" in buckets
+        ? { error: buckets.error }
+        : {
+            total_scored: buckets.total_scored,
+            top_count: buckets.top_count,
+            bottom_count: buckets.bottom_count,
+            updated_count: buckets.updated_count,
+          }),
+    },
+    patterns: {
+      job_id: patterns.job_id,
+      ...("error" in patterns
+        ? { error: patterns.error }
+        : { patterns_written: patterns.patterns_written }),
+    },
   });
 });
