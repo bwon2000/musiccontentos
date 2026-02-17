@@ -38,6 +38,7 @@ API base: `http://localhost:3000`
 |--------|------|-------------|
 | POST   | `/health` | Health check |
 | POST   | `/jobs/analyze_video` | Analyze one video (placeholder → video_analysis) |
+| POST   | `/jobs/analyze_batch` | Batch analyze N videos missing analysis → video_analysis |
 | POST   | `/jobs/recompute_patterns` | Recompute placeholder patterns (hook_type) |
 | POST   | `/jobs/generate_ideas` | Generate N placeholder ideas |
 | POST   | `/jobs/ingest_videos` | Ingest TikTok videos via Apify → `videos` table |
@@ -66,6 +67,26 @@ curl -X POST http://localhost:3000/jobs/analyze_video \
 
 Expected (success): `{"ok":true,"job_id":"...","video_id":"..."}`  
 Expected (video missing): `404` and `{"ok":false,"error":"Video not found","job_id":"..."}`
+
+### Analyze batch (videos missing analysis)
+
+Default limit 25, max 200. Selects videos with no `video_analysis` row and upserts placeholders.
+
+```bash
+curl -X POST https://musiccontentos.vercel.app/jobs/analyze_batch \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+With limit:
+
+```bash
+curl -X POST https://musiccontentos.vercel.app/jobs/analyze_batch \
+  -H "Content-Type: application/json" \
+  -d '{"limit":50}'
+```
+
+Expected: `{"ok":true,"job_id":"...","selected":N,"analyzed":N,"errors":0}`
 
 ### Recompute patterns
 

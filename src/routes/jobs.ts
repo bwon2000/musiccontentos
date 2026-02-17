@@ -7,6 +7,10 @@ const analyzeVideoSchema = z.object({
   video_id: z.string().uuid(),
 });
 
+const analyzeBatchSchema = z.object({
+  limit: z.number().int().min(1).max(200).optional().default(25),
+});
+
 const recomputePatternsSchema = z.object({
   platform: z.enum(["tiktok", "instagram", "youtube"]).optional(),
   metric: z.enum(["views", "engagement_rate"]).optional(),
@@ -224,6 +228,153 @@ jobsRoutes.post("/analyze_video", async (c) => {
         error: "Internal error",
         debug: err instanceof Error ? err.message : String(err),
       },
+      500
+    );
+  }
+});
+
+jobsRoutes.post("/analyze_batch", async (c) => {
+  let jobId: string | null = null;
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = analyzeBatchSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        { ok: false, error: "Invalid request", details: parsed.error.flatten() },
+        400
+      );
+    }
+    const { limit } = parsed.data;
+
+    const payload = { mode: "batch", limit };
+    jobId = await createJob("analyze_video", payload);
+
+    // Select videos missing analysis: fetch candidate videos, then exclude those that have video_analysis
+    const fetchSize = Math.min(limit * 2, 500);
+    const { data: candidateVideos, error: videosError } = await supabase
+      .from("videos")
+      .select("id")
+      .order("pulled_at", { ascending: false, nullsFirst: false })
+      .limit(fetchSize);
+
+    if (videosError) {
+      await updateJob(jobId, {
+        status: "error",
+        error_message: videosError.message,
+      });
+      return c.json(
+        { ok: false, error: videosError.message, job_id: jobId },
+        500
+      );
+    }
+
+    const candidateIds = (candidateVideos ?? []).map((v) => v.id).filter(Boolean);
+    if (candidateIds.length === 0) {
+      await updateJob(jobId, {
+        status: "done",
+        result: { mode: "batch", selected: 0, analyzed: 0, errors: 0, error_samples: [] },
+      });
+      return c.json({
+        ok: true,
+        job_id: jobId,
+        selected: 0,
+        analyzed: 0,
+        errors: 0,
+      });
+    }
+
+    const { data: existingAnalysis, error: analysisError } = await supabase
+      .from("video_analysis")
+      .select("video_id")
+      .in("video_id", candidateIds);
+
+    if (analysisError) {
+      await updateJob(jobId, {
+        status: "error",
+        error_message: analysisError.message,
+      });
+      return c.json(
+        { ok: false, error: analysisError.message, job_id: jobId },
+        500
+      );
+    }
+
+    const existingSet = new Set(
+      (existingAnalysis ?? []).map((r) => r.video_id).filter(Boolean)
+    );
+    const toAnalyze = candidateIds.filter((id) => !existingSet.has(id)).slice(0, limit);
+    const selected = toAnalyze.length;
+
+    const placeholderRow = (videoId: string) => {
+      const now = new Date().toISOString();
+      return {
+        video_id: videoId,
+        hook_text: "PLACEHOLDER: hook summary",
+        hook_type: "placeholder",
+        on_screen_text: "PLACEHOLDER: on-screen text",
+        format: "placeholder",
+        cta_type: "placeholder",
+        face_present: null,
+        transcript_summary: "PLACEHOLDER: transcript summary",
+        extracted_tags: { note: "replace with Gemini later" },
+        shots: [],
+        analyzed_at: now,
+        updated_at: now,
+      };
+    };
+
+    let analyzed = 0;
+    let errors = 0;
+    const errorSamples: Array<{ video_id: string; message: string }> = [];
+    const maxErrorSamples = 5;
+
+    for (const videoId of toAnalyze) {
+      const { error: upsertErr } = await supabase
+        .from("video_analysis")
+        .upsert(placeholderRow(videoId), { onConflict: "video_id" });
+
+      if (upsertErr) {
+        errors += 1;
+        if (errorSamples.length < maxErrorSamples) {
+          errorSamples.push({ video_id: videoId, message: upsertErr.message });
+        }
+      } else {
+        analyzed += 1;
+      }
+    }
+
+    const result = {
+      mode: "batch",
+      selected,
+      analyzed,
+      errors,
+      error_samples: errorSamples,
+    };
+    await updateJob(jobId, {
+      status: "done",
+      result,
+    });
+
+    return c.json({
+      ok: true,
+      job_id: jobId,
+      selected,
+      analyzed,
+      errors,
+    });
+  } catch (err) {
+    console.error("analyze_batch error:", err);
+    if (jobId) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
+      await updateJob(jobId, {
+        status: "error",
+        error_message: truncated,
+      }).catch(() => {});
+    }
+    return c.json(
+      { ok: false, error: err instanceof Error ? err.message : "Internal error" },
       500
     );
   }
