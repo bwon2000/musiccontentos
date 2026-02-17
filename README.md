@@ -18,6 +18,7 @@ Copy `.env.example` to `.env` and set:
 - `SUPABASE_SERVICE_ROLE_KEY` – service role key (never expose to client)
 - `APIFY_TOKEN` – required for `/jobs/ingest_videos` (TikTok scraper)
 - `APIFY_ACTOR_ID` – optional, default `clockworks/tiktok-hashtag-scraper`
+- **`CRON_SECRET`** – shared secret for cron endpoints; set in **Vercel** env. **Supabase Cron** must send it in the **`x-cron-secret`** header (legacy `x_cron_secret` also accepted).
 - `PORT` – optional, default `3000`
 
 ## Local run

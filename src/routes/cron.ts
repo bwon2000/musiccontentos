@@ -9,8 +9,6 @@ import {
 
 export const cronRoutes = new Hono();
 
-const CRON_SECRET_HEADER = "x_cron_secret";
-
 /** Check for overlapping run: recent (15 min) job with status=running and (type=ingest_videos or payload.mode=cron) */
 async function hasRecentCronRun(): Promise<boolean> {
   const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
@@ -30,9 +28,14 @@ async function hasRecentCronRun(): Promise<boolean> {
 }
 
 cronRoutes.post("/run", async (c) => {
-  const secret = c.req.header(CRON_SECRET_HEADER);
+  const secret =
+    c.req.header("x-cron-secret") ??
+    c.req.header("x_cron_secret") ??
+    c.req.header("X-CRON-SECRET") ??
+    c.req.header("X_CRON_SECRET");
   const expected = process.env.CRON_SECRET;
   if (!expected || secret !== expected) {
+    console.log("cron unauthorized", { hasExpected: !!expected, hasSecret: !!secret });
     return c.json({ ok: false, error: "Unauthorized" }, 401);
   }
 
@@ -66,9 +69,14 @@ cronRoutes.post("/run", async (c) => {
 const DEFAULT_ANALYZE_LIMIT = 50;
 
 cronRoutes.get("/analyze", async (c) => {
-  const secret = c.req.header(CRON_SECRET_HEADER);
+  const secret =
+    c.req.header("x-cron-secret") ??
+    c.req.header("x_cron_secret") ??
+    c.req.header("X-CRON-SECRET") ??
+    c.req.header("X_CRON_SECRET");
   const expected = process.env.CRON_SECRET;
   if (!expected || secret !== expected) {
+    console.log("cron unauthorized", { hasExpected: !!expected, hasSecret: !!secret });
     return c.json({ ok: false, error: "Unauthorized" }, 401);
   }
 
