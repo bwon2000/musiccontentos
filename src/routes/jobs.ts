@@ -76,6 +76,288 @@ async function updateJob(
   if (error) throw error;
 }
 
+/** Shared result types for cron */
+export type IngestResult =
+  | { job_id: string; total: number; upserted: number; skipped: number }
+  | { job_id: string; error: string };
+export type AnalyzeBatchResult =
+  | { job_id: string; selected: number; analyzed: number; errors: number }
+  | { job_id: string; error: string };
+export type RecomputePatternsResult =
+  | { job_id: string; patterns_written: number }
+  | { job_id: string; error: string };
+
+export const EDM_HASHTAGS = [
+  "edm", "edmtiktok", "rave", "ravelife", "bassmusic", "dubstep", "dnb", "drumandbass",
+  "techno", "housemusic", "deephouse", "progressivehouse", "hardstyle", "trance",
+  "melodictechno", "futurebass", "electrohouse",
+];
+
+/** Executor: ingest_videos. Used by POST /jobs/ingest_videos and cron. */
+export async function executeIngestVideos(
+  params: {
+    platform: "tiktok";
+    seeds: { hashtags: string[] };
+    limit?: number;
+    resultsPerHashtag?: number;
+  },
+  options?: { mode?: "cron" }
+): Promise<IngestResult> {
+  const payload = {
+    ...params,
+    ...(options?.mode ? { mode: options.mode } : {}),
+  };
+  let jobId: string | null = null;
+  try {
+    const apifyToken = process.env.APIFY_TOKEN;
+    const apifyActorId = process.env.APIFY_ACTOR_ID ?? "clockworks/tiktok-hashtag-scraper";
+    if (!apifyToken) throw new Error("APIFY_TOKEN is not configured");
+
+    jobId = await createJob("ingest_videos", payload);
+    const { seeds, limit, resultsPerHashtag } = params;
+    const hashtags = seeds.hashtags;
+
+    const runData = await runTikTokHashtagScraper(apifyActorId, apifyToken, {
+      hashtags,
+      resultsPerPage: resultsPerHashtag ?? 25,
+      proxyConfiguration: { useApifyProxy: true, apifyProxyGroups: ["RESIDENTIAL"] },
+    }, 120);
+
+    const limitNum = limit ?? 200;
+    const items = await getDatasetItems<Record<string, unknown>>(
+      runData.defaultDatasetId,
+      apifyToken,
+      limitNum
+    );
+
+    const pulledAt = new Date().toISOString();
+    const rowsByUrl = new Map<string, Record<string, unknown>>();
+    let skippedNoUrl = 0;
+    for (const item of items) {
+      const row = normalizeApifyItemToVideo(item, pulledAt);
+      if (!row) {
+        skippedNoUrl += 1;
+        continue;
+      }
+      if (row.video_url) rowsByUrl.set(String(row.video_url), row);
+    }
+    const rows = Array.from(rowsByUrl.values());
+    const total = items.length;
+    const skipped = skippedNoUrl;
+
+    if (rows.length > 0) {
+      const { error: upsertError } = await supabase
+        .from("videos")
+        .upsert(rows, { onConflict: "video_url" });
+      if (upsertError) throw upsertError;
+    }
+
+    const result = { total, upserted: rows.length, skipped };
+    await updateJob(jobId, { status: "done", result });
+    return { job_id: jobId, ...result };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
+    if (jobId) await updateJob(jobId, { status: "error", error_message: truncated }).catch(() => {});
+    return { job_id: jobId!, error: msg };
+  }
+}
+
+/** Executor: analyze_batch. Used by POST /jobs/analyze_batch and cron. */
+export async function executeAnalyzeBatch(
+  params: { limit: number },
+  options?: { mode?: "cron" }
+): Promise<AnalyzeBatchResult> {
+  const payload = options?.mode
+    ? { mode: "cron" as const, limit: params.limit }
+    : { mode: "batch" as const, limit: params.limit };
+  let jobId: string | null = null;
+  try {
+    jobId = await createJob("analyze_video", payload);
+
+    const limit = params.limit;
+    const fetchSize = Math.min(limit * 2, 500);
+    const { data: candidateVideos, error: videosError } = await supabase
+      .from("videos")
+      .select("id")
+      .order("pulled_at", { ascending: false, nullsFirst: false })
+      .limit(fetchSize);
+
+    if (videosError) throw videosError;
+    const candidateIds = (candidateVideos ?? []).map((v) => v.id).filter(Boolean);
+    if (candidateIds.length === 0) {
+      await updateJob(jobId, {
+        status: "done",
+        result: { mode: "batch", selected: 0, analyzed: 0, errors: 0, error_samples: [] },
+      });
+      return { job_id: jobId, selected: 0, analyzed: 0, errors: 0 };
+    }
+
+    const { data: existingAnalysis, error: analysisError } = await supabase
+      .from("video_analysis")
+      .select("video_id")
+      .in("video_id", candidateIds);
+    if (analysisError) throw analysisError;
+
+    const existingSet = new Set(
+      (existingAnalysis ?? []).map((r) => r.video_id).filter(Boolean)
+    );
+    const toAnalyze = candidateIds.filter((id) => !existingSet.has(id)).slice(0, limit);
+    const selected = toAnalyze.length;
+
+    const placeholderRow = (videoId: string) => {
+      const now = new Date().toISOString();
+      return {
+        video_id: videoId,
+        hook_text: "PLACEHOLDER: hook summary",
+        hook_type: "placeholder",
+        on_screen_text: "PLACEHOLDER: on-screen text",
+        format: "placeholder",
+        cta_type: "placeholder",
+        face_present: null,
+        transcript_summary: "PLACEHOLDER: transcript summary",
+        extracted_tags: { note: "replace with Gemini later" },
+        shots: [],
+        analyzed_at: now,
+        updated_at: now,
+      };
+    };
+
+    let analyzed = 0;
+    let errors = 0;
+    const errorSamples: Array<{ video_id: string; message: string }> = [];
+    const maxErrorSamples = 5;
+
+    for (const videoId of toAnalyze) {
+      const { error: upsertErr } = await supabase
+        .from("video_analysis")
+        .upsert(placeholderRow(videoId), { onConflict: "video_id" });
+      if (upsertErr) {
+        errors += 1;
+        if (errorSamples.length < maxErrorSamples)
+          errorSamples.push({ video_id: videoId, message: upsertErr.message });
+      } else {
+        analyzed += 1;
+      }
+    }
+
+    const result = { mode: "batch", selected, analyzed, errors, error_samples: errorSamples };
+    await updateJob(jobId, { status: "done", result });
+    return { job_id: jobId, selected, analyzed, errors };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
+    if (jobId) await updateJob(jobId, { status: "error", error_message: truncated }).catch(() => {});
+    return { job_id: jobId!, error: msg };
+  }
+}
+
+/** Executor: recompute_patterns. Used by POST /jobs/recompute_patterns and cron. */
+export async function executeRecomputePatterns(
+  params?: { platform?: string; metric?: string },
+  options?: { mode?: "cron" }
+): Promise<RecomputePatternsResult> {
+  const payload = { ...(params ?? {}), ...(options?.mode ? { mode: options.mode } : {}) };
+  let jobId: string | null = null;
+  try {
+    jobId = await createJob("recompute_patterns", payload);
+
+    const { data: analyses, error: fetchError } = await supabase
+      .from("video_analysis")
+      .select("video_id, hook_type");
+    if (fetchError) throw fetchError;
+
+    const rows = analyses ?? [];
+    const byHookType: Record<string, { count: number; videoIds: string[] }> = {};
+    for (const row of rows) {
+      const key = row.hook_type ?? "unknown";
+      if (!byHookType[key]) byHookType[key] = { count: 0, videoIds: [] };
+      byHookType[key].count += 1;
+      byHookType[key].videoIds.push(row.video_id);
+    }
+
+    const videoIds = rows.map((r) => r.video_id).filter(Boolean);
+    const { data: videoStats } = await supabase
+      .from("videos")
+      .select("id, views, engagement_rate")
+      .in("id", videoIds);
+
+    const viewsByVideo = new Map(
+      (videoStats ?? []).map((v) => [v.id, Number(v.views) ?? 0])
+    );
+    const engagementByVideo = new Map(
+      (videoStats ?? []).map((v) => [v.id, Number(v.engagement_rate) ?? 0])
+    );
+    const overallAvgViews =
+      videoStats?.length &&
+      videoStats.reduce((s, v) => s + (Number(v.views) ?? 0), 0) / videoStats.length;
+    const overallAvgEng =
+      videoStats?.length &&
+      videoStats.reduce((s, v) => s + (Number(v.engagement_rate) ?? 0), 0) / videoStats.length;
+
+    const now = new Date().toISOString();
+    const patternsToInsert: Array<{
+      feature_name: string;
+      feature_value: string;
+      sample_size: number;
+      top_freq: number | null;
+      bottom_freq: number | null;
+      uplift: number | null;
+      confidence_score: number | null;
+      examples: unknown;
+      computed_at: string;
+    }> = [];
+
+    const entries = Object.entries(byHookType)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 20);
+
+    for (const [hookType, { count, videoIds: ids }] of entries) {
+      const views = ids.map((id) => viewsByVideo.get(id) ?? 0).filter(Boolean);
+      const engagements = ids.map((id) => engagementByVideo.get(id) ?? 0).filter(Boolean);
+      const avgViews = views.length ? views.reduce((a, b) => a + b, 0) / views.length : null;
+      const avgEng = engagements.length
+        ? engagements.reduce((a, b) => a + b, 0) / engagements.length
+        : null;
+      const uplift =
+        overallAvgViews && avgViews
+          ? (avgViews - overallAvgViews) / overallAvgViews
+          : null;
+      patternsToInsert.push({
+        feature_name: "hook_type",
+        feature_value: hookType,
+        sample_size: count,
+        top_freq: avgViews ?? 0,
+        bottom_freq: avgEng ?? 0,
+        uplift,
+        confidence_score: count >= 3 ? 0.8 : 0.5,
+        examples: ids.slice(0, 5),
+        computed_at: now,
+      });
+    }
+
+    if (patternsToInsert.length > 0) {
+      await supabase.from("patterns").delete().eq("feature_name", "hook_type");
+      const { error: insertError } = await supabase.from("patterns").insert(patternsToInsert);
+      if (insertError) throw insertError;
+    }
+
+    await updateJob(jobId, {
+      status: "done",
+      result: {
+        patterns_written: patternsToInsert.length,
+        by_hook_type: Object.keys(byHookType).length,
+      },
+    });
+    return { job_id: jobId, patterns_written: patternsToInsert.length };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
+    if (jobId) await updateJob(jobId, { status: "error", error_message: truncated }).catch(() => {});
+    return { job_id: jobId!, error: msg };
+  }
+}
+
 export const jobsRoutes = new Hono();
 
 jobsRoutes.post("/analyze_video", async (c) => {
@@ -234,300 +516,46 @@ jobsRoutes.post("/analyze_video", async (c) => {
 });
 
 jobsRoutes.post("/analyze_batch", async (c) => {
-  let jobId: string | null = null;
-
-  try {
-    const body = await c.req.json().catch(() => ({}));
-    const parsed = analyzeBatchSchema.safeParse(body);
-    if (!parsed.success) {
-      return c.json(
-        { ok: false, error: "Invalid request", details: parsed.error.flatten() },
-        400
-      );
-    }
-    const { limit } = parsed.data;
-
-    const payload = { mode: "batch", limit };
-    jobId = await createJob("analyze_video", payload);
-
-    // Select videos missing analysis: fetch candidate videos, then exclude those that have video_analysis
-    const fetchSize = Math.min(limit * 2, 500);
-    const { data: candidateVideos, error: videosError } = await supabase
-      .from("videos")
-      .select("id")
-      .order("pulled_at", { ascending: false, nullsFirst: false })
-      .limit(fetchSize);
-
-    if (videosError) {
-      await updateJob(jobId, {
-        status: "error",
-        error_message: videosError.message,
-      });
-      return c.json(
-        { ok: false, error: videosError.message, job_id: jobId },
-        500
-      );
-    }
-
-    const candidateIds = (candidateVideos ?? []).map((v) => v.id).filter(Boolean);
-    if (candidateIds.length === 0) {
-      await updateJob(jobId, {
-        status: "done",
-        result: { mode: "batch", selected: 0, analyzed: 0, errors: 0, error_samples: [] },
-      });
-      return c.json({
-        ok: true,
-        job_id: jobId,
-        selected: 0,
-        analyzed: 0,
-        errors: 0,
-      });
-    }
-
-    const { data: existingAnalysis, error: analysisError } = await supabase
-      .from("video_analysis")
-      .select("video_id")
-      .in("video_id", candidateIds);
-
-    if (analysisError) {
-      await updateJob(jobId, {
-        status: "error",
-        error_message: analysisError.message,
-      });
-      return c.json(
-        { ok: false, error: analysisError.message, job_id: jobId },
-        500
-      );
-    }
-
-    const existingSet = new Set(
-      (existingAnalysis ?? []).map((r) => r.video_id).filter(Boolean)
-    );
-    const toAnalyze = candidateIds.filter((id) => !existingSet.has(id)).slice(0, limit);
-    const selected = toAnalyze.length;
-
-    const placeholderRow = (videoId: string) => {
-      const now = new Date().toISOString();
-      return {
-        video_id: videoId,
-        hook_text: "PLACEHOLDER: hook summary",
-        hook_type: "placeholder",
-        on_screen_text: "PLACEHOLDER: on-screen text",
-        format: "placeholder",
-        cta_type: "placeholder",
-        face_present: null,
-        transcript_summary: "PLACEHOLDER: transcript summary",
-        extracted_tags: { note: "replace with Gemini later" },
-        shots: [],
-        analyzed_at: now,
-        updated_at: now,
-      };
-    };
-
-    let analyzed = 0;
-    let errors = 0;
-    const errorSamples: Array<{ video_id: string; message: string }> = [];
-    const maxErrorSamples = 5;
-
-    for (const videoId of toAnalyze) {
-      const { error: upsertErr } = await supabase
-        .from("video_analysis")
-        .upsert(placeholderRow(videoId), { onConflict: "video_id" });
-
-      if (upsertErr) {
-        errors += 1;
-        if (errorSamples.length < maxErrorSamples) {
-          errorSamples.push({ video_id: videoId, message: upsertErr.message });
-        }
-      } else {
-        analyzed += 1;
-      }
-    }
-
-    const result = {
-      mode: "batch",
-      selected,
-      analyzed,
-      errors,
-      error_samples: errorSamples,
-    };
-    await updateJob(jobId, {
-      status: "done",
-      result,
-    });
-
-    return c.json({
-      ok: true,
-      job_id: jobId,
-      selected,
-      analyzed,
-      errors,
-    });
-  } catch (err) {
-    console.error("analyze_batch error:", err);
-    if (jobId) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
-      await updateJob(jobId, {
-        status: "error",
-        error_message: truncated,
-      }).catch(() => {});
-    }
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = analyzeBatchSchema.safeParse(body);
+  if (!parsed.success) {
     return c.json(
-      { ok: false, error: err instanceof Error ? err.message : "Internal error" },
-      500
+      { ok: false, error: "Invalid request", details: parsed.error.flatten() },
+      400
     );
   }
+  const result = await executeAnalyzeBatch({ limit: parsed.data.limit });
+  if ("error" in result) {
+    return c.json({ ok: false, error: result.error, job_id: result.job_id }, 500);
+  }
+  return c.json({
+    ok: true,
+    job_id: result.job_id,
+    selected: result.selected,
+    analyzed: result.analyzed,
+    errors: result.errors,
+  });
 });
 
 jobsRoutes.post("/recompute_patterns", async (c) => {
-  let jobId: string | null = null;
-
-  try {
-    const body = await c.req.json().catch(() => ({}));
-    const parsed = recomputePatternsSchema.safeParse(body);
-    if (!parsed.success) {
-      return c.json(
-        { ok: false, error: "Invalid request", details: parsed.error.flatten() },
-        400
-      );
-    }
-    const payload = parsed.data as Record<string, unknown>;
-    jobId = await createJob("recompute_patterns", payload);
-
-    const { data: analyses, error: fetchError } = await supabase
-      .from("video_analysis")
-      .select("video_id, hook_type");
-
-    if (fetchError) {
-      await updateJob(jobId, {
-        status: "error",
-        error_message: fetchError.message,
-      });
-      return c.json(
-        { ok: false, error: fetchError.message, job_id: jobId },
-        500
-      );
-    }
-
-    const rows = analyses ?? [];
-    const byHookType: Record<string, { count: number; videoIds: string[] }> = {};
-    for (const row of rows) {
-      const key = row.hook_type ?? "unknown";
-      if (!byHookType[key]) {
-        byHookType[key] = { count: 0, videoIds: [] };
-      }
-      byHookType[key].count += 1;
-      byHookType[key].videoIds.push(row.video_id);
-    }
-
-    const videoIds = rows.map((r) => r.video_id).filter(Boolean);
-    const { data: videoStats } = await supabase
-      .from("videos")
-      .select("id, views, engagement_rate")
-      .in("id", videoIds);
-
-    const viewsByVideo = new Map(
-      (videoStats ?? []).map((v) => [v.id, Number(v.views) ?? 0])
-    );
-    const engagementByVideo = new Map(
-      (videoStats ?? []).map((v) => [v.id, Number(v.engagement_rate) ?? 0])
-    );
-    const overallAvgViews =
-      videoStats?.length &&
-      videoStats.reduce((s, v) => s + (Number(v.views) ?? 0), 0) / videoStats.length;
-    const overallAvgEng =
-      videoStats?.length &&
-      videoStats.reduce((s, v) => s + (Number(v.engagement_rate) ?? 0), 0) / videoStats.length;
-
-    const now = new Date().toISOString();
-    const patternsToInsert: Array<{
-      feature_name: string;
-      feature_value: string;
-      sample_size: number;
-      top_freq: number | null;
-      bottom_freq: number | null;
-      uplift: number | null;
-      confidence_score: number | null;
-      examples: unknown;
-      computed_at: string;
-    }> = [];
-
-    const entries = Object.entries(byHookType)
-      .sort((a, b) => b[1].count - a[1].count)
-      .slice(0, 20);
-
-    for (const [hookType, { count, videoIds: ids }] of entries) {
-      const views = ids.map((id) => viewsByVideo.get(id) ?? 0).filter(Boolean);
-      const engagements = ids.map((id) => engagementByVideo.get(id) ?? 0).filter(Boolean);
-      const avgViews = views.length ? views.reduce((a, b) => a + b, 0) / views.length : null;
-      const avgEng = engagements.length
-        ? engagements.reduce((a, b) => a + b, 0) / engagements.length
-        : null;
-      const uplift =
-        overallAvgViews && avgViews
-          ? (avgViews - overallAvgViews) / overallAvgViews
-          : null;
-
-      patternsToInsert.push({
-        feature_name: "hook_type",
-        feature_value: hookType,
-        sample_size: count,
-        top_freq: avgViews ?? 0,
-        bottom_freq: avgEng ?? 0,
-        uplift,
-        confidence_score: count >= 3 ? 0.8 : 0.5,
-        examples: ids.slice(0, 5),
-        computed_at: now,
-      });
-    }
-
-    if (patternsToInsert.length > 0) {
-      await supabase
-        .from("patterns")
-        .delete()
-        .eq("feature_name", "hook_type");
-      const { error: insertError } = await supabase
-        .from("patterns")
-        .insert(patternsToInsert);
-      if (insertError) {
-        await updateJob(jobId, {
-          status: "error",
-          error_message: insertError.message,
-        });
-        return c.json(
-          { ok: false, error: insertError.message, job_id: jobId },
-          500
-        );
-      }
-    }
-
-    await updateJob(jobId, {
-      status: "done",
-      result: {
-        patterns_written: patternsToInsert.length,
-        by_hook_type: Object.keys(byHookType).length,
-      },
-    });
-
-    return c.json({
-      ok: true,
-      job_id: jobId,
-      patterns_written: patternsToInsert.length,
-    });
-  } catch (err) {
-    console.error("recompute_patterns error:", err);
-    if (jobId) {
-      await updateJob(jobId, {
-        status: "error",
-        error_message: err instanceof Error ? err.message : "Unknown error",
-      }).catch(() => {});
-    }
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = recomputePatternsSchema.safeParse(body);
+  if (!parsed.success) {
     return c.json(
-      { ok: false, error: err instanceof Error ? err.message : "Internal error" },
-      500
+      { ok: false, error: "Invalid request", details: parsed.error.flatten() },
+      400
     );
   }
+  const params = parsed.data as { platform?: string; metric?: string };
+  const result = await executeRecomputePatterns(params);
+  if ("error" in result) {
+    return c.json({ ok: false, error: result.error, job_id: result.job_id }, 500);
+  }
+  return c.json({
+    ok: true,
+    job_id: result.job_id,
+    patterns_written: result.patterns_written,
+  });
 });
 
 jobsRoutes.post("/generate_ideas", async (c) => {
@@ -645,116 +673,29 @@ function normalizeApifyItemToVideo(
 }
 
 jobsRoutes.post("/ingest_videos", async (c) => {
-  let jobId: string | null = null;
-
-  try {
-    const body = await c.req.json().catch(() => ({}));
-    const parsed = ingestVideosSchema.safeParse(body);
-    if (!parsed.success) {
-      return c.json(
-        { ok: false, error: "Invalid request", details: parsed.error.flatten() },
-        400
-      );
-    }
-    const { platform, seeds, limit, resultsPerHashtag } = parsed.data;
-
-    const apifyToken = process.env.APIFY_TOKEN;
-    const apifyActorId =
-      process.env.APIFY_ACTOR_ID ?? "clockworks/tiktok-hashtag-scraper";
-    if (!apifyToken) {
-      return c.json(
-        { ok: false, error: "APIFY_TOKEN is not configured" },
-        500
-      );
-    }
-
-    const payload = {
-      platform,
-      seeds,
-      limit: limit ?? undefined,
-      resultsPerHashtag: resultsPerHashtag ?? undefined,
-    };
-    jobId = await createJob("ingest_videos", payload);
-
-    const hashtags = seeds.hashtags;
-    const runData = await runTikTokHashtagScraper(
-      apifyActorId,
-      apifyToken,
-      {
-        hashtags,
-        resultsPerPage: resultsPerHashtag ?? 25,
-        proxyConfiguration: {
-          useApifyProxy: true,
-          apifyProxyGroups: ["RESIDENTIAL"],
-        },
-      },
-      120
-    );
-
-    const limitNum = limit ?? 200;
-    const items = await getDatasetItems<Record<string, unknown>>(
-      runData.defaultDatasetId,
-      apifyToken,
-      limitNum
-    );
-
-    const pulledAt = new Date().toISOString();
-    const rowsByUrl = new Map<string, Record<string, unknown>>();
-    let skippedNoUrl = 0;
-    for (const item of items) {
-      const row = normalizeApifyItemToVideo(item, pulledAt);
-      if (!row) {
-        skippedNoUrl += 1;
-        continue;
-      }
-      if (row.video_url) rowsByUrl.set(String(row.video_url), row);
-    }
-    const rows = Array.from(rowsByUrl.values());
-
-    const total = items.length;
-    const skipped = skippedNoUrl;
-
-    if (rows.length > 0) {
-      const { error: upsertError } = await supabase
-        .from("videos")
-        .upsert(rows, { onConflict: "video_url" });
-
-      if (upsertError) {
-        await updateJob(jobId, {
-          status: "error",
-          error_message: upsertError.message,
-        });
-        return c.json(
-          { ok: false, error: upsertError.message, job_id: jobId },
-          500
-        );
-      }
-    }
-
-    const result = { total, upserted: rows.length, skipped };
-    await updateJob(jobId, {
-      status: "done",
-      result,
-    });
-
-    return c.json({
-      ok: true,
-      job_id: jobId,
-      ...result,
-    });
-  } catch (err) {
-    console.error("ingest_videos error:", err);
-    if (jobId) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      const truncated = msg.length > 1000 ? msg.slice(0, 1000) + "…" : msg;
-      await updateJob(jobId, {
-        status: "error",
-        error_message: truncated,
-      }).catch(() => {});
-    }
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = ingestVideosSchema.safeParse(body);
+  if (!parsed.success) {
     return c.json(
-      { ok: false, error: err instanceof Error ? err.message : "Internal error" },
-      500
+      { ok: false, error: "Invalid request", details: parsed.error.flatten() },
+      400
     );
   }
+  const { platform, seeds, limit, resultsPerHashtag } = parsed.data;
+  const result = await executeIngestVideos({
+    platform,
+    seeds,
+    limit: limit ?? undefined,
+    resultsPerHashtag: resultsPerHashtag ?? undefined,
+  });
+  if ("error" in result) {
+    return c.json({ ok: false, error: result.error, job_id: result.job_id }, 500);
+  }
+  return c.json({
+    ok: true,
+    job_id: result.job_id,
+    total: result.total,
+    upserted: result.upserted,
+    skipped: result.skipped,
+  });
 });

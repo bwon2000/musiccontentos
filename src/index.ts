@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { healthRoutes } from "./routes/health.js";
 import { jobsRoutes } from "./routes/jobs.js";
+import { cronRoutes } from "./routes/cron.js";
 
 const app = new Hono();
 
@@ -19,6 +20,7 @@ app.use(
 
 app.route("/", healthRoutes);
 app.route("/jobs", jobsRoutes);
+app.route("/cron", cronRoutes);
 
 app.onError((err, c) => {
   console.error("Unhandled error:", err);
