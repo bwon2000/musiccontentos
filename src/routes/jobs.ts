@@ -548,14 +548,20 @@ jobsRoutes.post("/ingest_videos", async (c) => {
     );
 
     const pulledAt = new Date().toISOString();
-    const rows: Record<string, unknown>[] = [];
+    const rowsByUrl = new Map<string, Record<string, unknown>>();
+    let skippedNoUrl = 0;
     for (const item of items) {
       const row = normalizeApifyItemToVideo(item, pulledAt);
-      if (row) rows.push(row);
+      if (!row) {
+        skippedNoUrl += 1;
+        continue;
+      }
+      if (row.video_url) rowsByUrl.set(String(row.video_url), row);
     }
+    const rows = Array.from(rowsByUrl.values());
 
     const total = items.length;
-    const skipped = total - rows.length;
+    const skipped = skippedNoUrl;
 
     if (rows.length > 0) {
       const { error: upsertError } = await supabase
